@@ -27,9 +27,9 @@ Requires **Python >= 3.10** and `requests`. `tqdm` is optional for progress bars
 ### Install from GitHub
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/baidupan.git
+pip install git+https://github.com/y-itao/baidupan.git
 # or with progress bar
-pip install "baidupan[progress] @ git+https://github.com/YOUR_USERNAME/baidupan.git"
+pip install "baidupan[progress] @ git+https://github.com/y-itao/baidupan.git"
 ```
 
 ## Quick Start
