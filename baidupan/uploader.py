@@ -3,7 +3,10 @@
 import json
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 from . import config
 from .api import BaiduPanAPI
@@ -11,6 +14,9 @@ from .hasher import compute_hashes
 from .utils import ProgressBar
 
 log = logging.getLogger(__name__)
+
+# Maximum number of session refreshes before giving up
+MAX_SESSION_REFRESHES = 5
 
 
 # ── Upload progress persistence ───────────────────────────────────
@@ -49,20 +55,14 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
                 workers: int = None, rtype: int = 3) -> dict:
     """Upload a single file with rapid-upload attempt, chunked upload, and resume.
 
-    Parameters
-    ----------
-    api : BaiduPanAPI
-    local_path : str  – absolute local file path
-    remote_path : str – absolute remote path (already under REMOTE_ROOT)
-    workers : int – concurrent upload workers
-    rtype : int – rename policy (3 = rename on conflict)
-
-    Returns
-    -------
-    dict – create file API response
+    For very large files (>4GB), the upload session (uploadid) may expire
+    after ~2000 slices. This function automatically detects 400 errors,
+    re-creates the upload session via precreate, and continues uploading
+    the remaining slices.
     """
     workers = workers or config.MAX_UPLOAD_WORKERS
     file_size = os.path.getsize(local_path)
+    chunk_size = config.UPLOAD_CHUNK_SIZE
 
     # compute hashes (single-pass, cached)
     hashes = compute_hashes(local_path)
@@ -92,42 +92,28 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
     # ── Step 2: check resume state ────────────────────────────────
     progress = _load_progress(remote_path)
     uploaded_parts = set()
-    if progress and progress.get("upload_id") == upload_id:
+    if progress:
+        # Accept progress from any upload_id (session may have changed)
         uploaded_parts = set(progress.get("uploaded_parts", []))
-        log.info("Resuming upload: %d/%d slices already uploaded",
-                 len(uploaded_parts), len(hashes.block_list))
+        if uploaded_parts:
+            log.info("Resuming upload: %d/%d slices already uploaded",
+                     len(uploaded_parts), len(hashes.block_list))
 
-    parts_to_upload = [i for i in block_list_need if i not in uploaded_parts]
+    parts_remaining = [i for i in block_list_need if i not in uploaded_parts]
 
-    if not parts_to_upload:
+    if not parts_remaining:
         log.info("All slices already uploaded, creating file...")
     else:
-        chunk_size = config.UPLOAD_CHUNK_SIZE
-        total_bytes = sum(
-            min(chunk_size, file_size - i * chunk_size) for i in parts_to_upload
+        # Upload slices with automatic session refresh on 400 errors
+        _upload_slices_with_refresh(
+            api, local_path, remote_path, file_size, chunk_size,
+            hashes, upload_id, parts_remaining, uploaded_parts,
+            workers, rtype,
         )
-
-        with ProgressBar(total_bytes, desc=f"Uploading {os.path.basename(local_path)}") as pbar:
-            def _upload_one(partseq: int) -> int:
-                offset = partseq * chunk_size
-                length = min(chunk_size, file_size - offset)
-                with open(local_path, "rb") as f:
-                    f.seek(offset)
-                    data = f.read(length)
-                api.upload_slice(upload_id, remote_path, partseq, data)
-                pbar.update(length)
-                return partseq
-
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(_upload_one, seq): seq for seq in parts_to_upload}
-                for future in as_completed(futures):
-                    seq = future.result()  # raises on error
-                    uploaded_parts.add(seq)
-                    # persist progress after each slice
-                    _save_progress(remote_path, {
-                        "upload_id": upload_id,
-                        "uploaded_parts": sorted(uploaded_parts),
-                    })
+        # Get the latest upload_id from progress (may have been refreshed)
+        progress = _load_progress(remote_path)
+        if progress and progress.get("upload_id"):
+            upload_id = progress["upload_id"]
 
     # ── Step 3: create file ───────────────────────────────────────
     result = api.create_file(
@@ -141,6 +127,116 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
     _clear_progress(remote_path)
     log.info("Upload complete: %s -> %s", local_path, remote_path)
     return result
+
+
+def _upload_slices_with_refresh(api, local_path, remote_path, file_size,
+                                chunk_size, hashes, upload_id,
+                                parts_remaining, uploaded_parts,
+                                workers, rtype):
+    """Upload slices, automatically refreshing the upload session on 400 errors.
+
+    When the Baidu API returns 400 for upload_slice (session expired),
+    this function re-precreates to get a new uploadid and continues
+    uploading the remaining slices.
+    """
+    current_upload_id = upload_id
+    progress_lock = threading.Lock()
+    session_refreshes = 0
+
+    total_bytes = sum(
+        min(chunk_size, file_size - i * chunk_size) for i in parts_remaining
+    )
+
+    with ProgressBar(file_size, desc=f"Uploading {os.path.basename(local_path)}") as pbar:
+        # Show already-uploaded progress
+        already_bytes = sum(
+            min(chunk_size, file_size - i * chunk_size)
+            for i in uploaded_parts
+        )
+        if already_bytes > 0:
+            pbar.update(already_bytes)
+
+        while parts_remaining:
+            failed_parts = []
+            batch_success = True
+
+            def _upload_one(partseq: int) -> int:
+                offset = partseq * chunk_size
+                length = min(chunk_size, file_size - offset)
+                with open(local_path, "rb") as f:
+                    f.seek(offset)
+                    data = f.read(length)
+                api.upload_slice(current_upload_id, remote_path, partseq, data)
+                pbar.update(length)
+                return partseq
+
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(_upload_one, seq): seq
+                        for seq in parts_remaining
+                    }
+                    for future in as_completed(futures):
+                        try:
+                            seq = future.result()
+                            with progress_lock:
+                                uploaded_parts.add(seq)
+                                _save_progress(remote_path, {
+                                    "upload_id": current_upload_id,
+                                    "uploaded_parts": sorted(uploaded_parts),
+                                })
+                        except requests.HTTPError as e:
+                            seq = futures[future]
+                            status = e.response.status_code if e.response is not None else 0
+                            if status == 400:
+                                failed_parts.append(seq)
+                                batch_success = False
+                            else:
+                                raise
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                if status == 400:
+                    batch_success = False
+                else:
+                    raise
+
+            if batch_success:
+                break  # all done
+
+            # Session expired -- refresh uploadid
+            session_refreshes += 1
+            if session_refreshes > MAX_SESSION_REFRESHES:
+                raise RuntimeError(
+                    f"Upload session expired {MAX_SESSION_REFRESHES} times, giving up. "
+                    f"Progress saved ({len(uploaded_parts)} slices). "
+                    f"Re-run the command to resume."
+                )
+
+            # Determine which parts still need uploading
+            parts_remaining = [
+                i for i in range(len(hashes.block_list))
+                if i not in uploaded_parts
+            ]
+
+            log.warning(
+                "Upload session expired (400 on %d slices). "
+                "Refreshing session... (%d/%d slices done, %d remaining)",
+                len(failed_parts), len(uploaded_parts),
+                len(hashes.block_list), len(parts_remaining),
+            )
+
+            # Re-precreate to get a new upload session
+            pre = api.precreate(
+                remote_path=remote_path,
+                size=file_size,
+                isdir=0,
+                block_list=hashes.block_list,
+                content_md5=hashes.content_md5,
+                slice_md5=hashes.slice_md5,
+                rtype=rtype,
+            )
+            current_upload_id = pre["uploadid"]
+            log.info("New upload session obtained, continuing upload...")
 
 
 def upload_dir(api: BaiduPanAPI, local_dir: str, remote_dir: str,

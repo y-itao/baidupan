@@ -147,7 +147,7 @@ class BaiduPanAPI:
         resp.raise_for_status()
         return self._check(resp.json())
 
-    @retry(exceptions=(requests.RequestException,))
+    @retry(max_retries=5, exceptions=(requests.RequestException,))
     def upload_slice(self, upload_id: str, remote_path: str,
                      partseq: int, data: bytes) -> dict:
         resp = self.session.post(config.UPLOAD_URL, params=self._params({
