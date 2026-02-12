@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,17 +56,30 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
                 workers: int = None, rtype: int = 3) -> dict:
     """Upload a single file with rapid-upload attempt, chunked upload, and resume.
 
-    For very large files (>4GB), the upload session (uploadid) may expire
-    after ~2000 slices. This function automatically detects 400 errors,
-    re-creates the upload session via precreate, and continues uploading
-    the remaining slices.
+    For large files, automatically scales chunk size to stay under Baidu's
+    ~2048 partseq limit (default safe limit: 1024 slices). For example,
+    a 12GB file uses 16MB chunks instead of 4MB.
+
+    Also handles session expiry (400 errors) by re-creating the upload
+    session via precreate and continuing from where it left off.
     """
     workers = workers or config.MAX_UPLOAD_WORKERS
     file_size = os.path.getsize(local_path)
+
+    # Auto-scale chunk size for large files to stay under Baidu's slice limit
     chunk_size = config.UPLOAD_CHUNK_SIZE
+    num_slices = math.ceil(file_size / chunk_size) if file_size > 0 else 1
+    if num_slices > config.MAX_UPLOAD_SLICES:
+        # Round up to nearest 4MB multiple
+        unit = config.UPLOAD_CHUNK_SIZE
+        chunk_size = math.ceil(file_size / config.MAX_UPLOAD_SLICES / unit) * unit
+        log.info("Large file (%d bytes, %d slices at 4MB). "
+                 "Auto-scaled chunk size to %d MB to stay under %d slices.",
+                 file_size, num_slices, chunk_size // (1024 * 1024),
+                 config.MAX_UPLOAD_SLICES)
 
     # compute hashes (single-pass, cached)
-    hashes = compute_hashes(local_path)
+    hashes = compute_hashes(local_path, chunk_size=chunk_size)
 
     # ── Step 1: precreate (also attempts rapid upload) ────────────
     pre = api.precreate(
@@ -93,11 +107,16 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
     progress = _load_progress(remote_path)
     uploaded_parts = set()
     if progress:
-        # Accept progress from any upload_id (session may have changed)
-        uploaded_parts = set(progress.get("uploaded_parts", []))
-        if uploaded_parts:
-            log.info("Resuming upload: %d/%d slices already uploaded",
-                     len(uploaded_parts), len(hashes.block_list))
+        saved_chunk = progress.get("chunk_size", config.UPLOAD_CHUNK_SIZE)
+        if saved_chunk != chunk_size:
+            log.info("Chunk size changed (%d -> %d), discarding old progress",
+                     saved_chunk, chunk_size)
+            _clear_progress(remote_path)
+        else:
+            uploaded_parts = set(progress.get("uploaded_parts", []))
+            if uploaded_parts:
+                log.info("Resuming upload: %d/%d slices already uploaded",
+                         len(uploaded_parts), len(hashes.block_list))
 
     parts_remaining = [i for i in block_list_need if i not in uploaded_parts]
 
@@ -184,6 +203,7 @@ def _upload_slices_with_refresh(api, local_path, remote_path, file_size,
                                 _save_progress(remote_path, {
                                     "upload_id": current_upload_id,
                                     "uploaded_parts": sorted(uploaded_parts),
+                                    "chunk_size": chunk_size,
                                 })
                         except requests.HTTPError as e:
                             seq = futures[future]

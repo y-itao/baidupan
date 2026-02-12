@@ -31,7 +31,8 @@ CREATE_URL = f"{API_BASE}/rest/2.0/xpan/file?method=create"
 UPLOAD_URL = f"{PCS_BASE}/rest/2.0/pcs/superfile2?method=upload"
 
 # ── Upload / Download defaults ────────────────────────────────────
-UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024       # 4 MB per slice (Baidu API max is 4MB)
+UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024       # 4 MB per slice (default)
+MAX_UPLOAD_SLICES = 1024                  # Safe limit (Baidu hard limit ~2048 partseq)
 RAPID_UPLOAD_THRESHOLD = 256 * 1024       # 256 KB minimum for rapid upload
 DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024     # 4 MB read buffer
 DOWNLOAD_SEGMENT_SIZE = 4 * 1024 * 1024   # 4 MB per concurrent segment

@@ -18,8 +18,8 @@ from . import config
 log = logging.getLogger(__name__)
 
 
-def _cache_key(filepath: str, mtime: float, size: int) -> str:
-    return f"{filepath}|{mtime}|{size}"
+def _cache_key(filepath: str, mtime: float, size: int, chunk_size: int) -> str:
+    return f"{filepath}|{mtime}|{size}|{chunk_size}"
 
 
 def _load_cache() -> dict:
@@ -62,15 +62,19 @@ class FileHashes:
         return cls(d["content_md5"], d["slice_md5"], d["block_list"], d["file_size"])
 
 
-def compute_hashes(filepath: str, use_cache: bool = True) -> FileHashes:
+def compute_hashes(filepath: str, use_cache: bool = True,
+                   chunk_size: int = None) -> FileHashes:
     """Compute content_md5, slice_md5, and block_list in a single read pass.
 
-    Results are cached by (filepath, mtime, size) to avoid recomputation.
+    Results are cached by (filepath, mtime, size, chunk_size) to avoid recomputation.
+    chunk_size controls the block_list granularity (default: config.UPLOAD_CHUNK_SIZE).
     """
+    if chunk_size is None:
+        chunk_size = config.UPLOAD_CHUNK_SIZE
     stat = os.stat(filepath)
     size = stat.st_size
     mtime = stat.st_mtime
-    key = _cache_key(filepath, mtime, size)
+    key = _cache_key(filepath, mtime, size, chunk_size)
 
     if use_cache:
         cache = _load_cache()
@@ -86,7 +90,6 @@ def compute_hashes(filepath: str, use_cache: bool = True) -> FileHashes:
     slice_hasher = hashlib.md5()
     block_list: list[str] = []
 
-    chunk_size = config.UPLOAD_CHUNK_SIZE
     slice_limit = 256 * 1024  # first 256 KB for slice_md5
     bytes_read = 0
     block_hasher = hashlib.md5()
