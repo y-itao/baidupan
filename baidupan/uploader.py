@@ -73,6 +73,16 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
         # Round up to nearest 4MB multiple
         unit = config.UPLOAD_CHUNK_SIZE
         chunk_size = math.ceil(file_size / config.MAX_UPLOAD_SLICES / unit) * unit
+        # Cap at max allowed slice size
+        if chunk_size > config.MAX_UPLOAD_CHUNK_SIZE:
+            chunk_size = config.MAX_UPLOAD_CHUNK_SIZE
+            max_size_gb = config.MAX_UPLOAD_CHUNK_SIZE * config.MAX_UPLOAD_SLICES / (1024**3)
+            raise ValueError(
+                f"File too large ({file_size / (1024**3):.1f} GB). "
+                f"Maximum supported file size is ~{max_size_gb:.0f} GB "
+                f"({config.MAX_UPLOAD_SLICES} slices × "
+                f"{config.MAX_UPLOAD_CHUNK_SIZE // (1024**2)} MB/slice). "
+            )
         log.info("Large file (%d bytes, %d slices at 4MB). "
                  "Auto-scaled chunk size to %d MB to stay under %d slices.",
                  file_size, num_slices, chunk_size // (1024 * 1024),
