@@ -32,8 +32,7 @@ UPLOAD_URL = f"{PCS_BASE}/rest/2.0/pcs/superfile2?method=upload"
 
 # ── Upload / Download defaults ────────────────────────────────────
 UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024       # 4 MB per slice (default)
-MAX_UPLOAD_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB max per slice (Baidu SVIP limit)
-MAX_UPLOAD_SLICES = 1024                  # Safe limit (Baidu hard limit ~2048 partseq)
+MAX_UPLOAD_SLICES = 2000                  # Near Baidu hard limit (~2048 partseq)
 RAPID_UPLOAD_THRESHOLD = 256 * 1024       # 256 KB minimum for rapid upload
 DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024     # 4 MB read buffer
 DOWNLOAD_SEGMENT_SIZE = 4 * 1024 * 1024   # 4 MB per concurrent segment

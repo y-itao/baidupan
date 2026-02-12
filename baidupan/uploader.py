@@ -66,27 +66,21 @@ def upload_file(api: BaiduPanAPI, local_path: str, remote_path: str,
     workers = workers or config.MAX_UPLOAD_WORKERS
     file_size = os.path.getsize(local_path)
 
-    # Auto-scale chunk size for large files to stay under Baidu's slice limit
+    # Auto-scale chunk size for large files to stay under Baidu's ~2048 partseq limit
     chunk_size = config.UPLOAD_CHUNK_SIZE
     num_slices = math.ceil(file_size / chunk_size) if file_size > 0 else 1
     if num_slices > config.MAX_UPLOAD_SLICES:
         # Round up to nearest 4MB multiple
         unit = config.UPLOAD_CHUNK_SIZE
         chunk_size = math.ceil(file_size / config.MAX_UPLOAD_SLICES / unit) * unit
-        # Cap at max allowed slice size
-        if chunk_size > config.MAX_UPLOAD_CHUNK_SIZE:
-            chunk_size = config.MAX_UPLOAD_CHUNK_SIZE
-            max_size_gb = config.MAX_UPLOAD_CHUNK_SIZE * config.MAX_UPLOAD_SLICES / (1024**3)
-            raise ValueError(
-                f"File too large ({file_size / (1024**3):.1f} GB). "
-                f"Maximum supported file size is ~{max_size_gb:.0f} GB "
-                f"({config.MAX_UPLOAD_SLICES} slices × "
-                f"{config.MAX_UPLOAD_CHUNK_SIZE // (1024**2)} MB/slice). "
-            )
-        log.info("Large file (%d bytes, %d slices at 4MB). "
-                 "Auto-scaled chunk size to %d MB to stay under %d slices.",
-                 file_size, num_slices, chunk_size // (1024 * 1024),
-                 config.MAX_UPLOAD_SLICES)
+        chunk_mb = chunk_size // (1024 * 1024)
+        final_slices = math.ceil(file_size / chunk_size)
+        log.info("Large file (%.1f GB, %d slices at 4MB). "
+                 "Auto-scaled chunk size to %d MB (%d slices).",
+                 file_size / (1024**3), num_slices, chunk_mb, final_slices)
+        if chunk_mb > 32:
+            log.warning("Chunk size %d MB exceeds Baidu's documented 32 MB SVIP limit. "
+                        "Upload may fail depending on your account tier.", chunk_mb)
 
     # compute hashes (single-pass, cached)
     hashes = compute_hashes(local_path, chunk_size=chunk_size)
