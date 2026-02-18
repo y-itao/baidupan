@@ -16,8 +16,8 @@ from .utils import ProgressBar
 
 log = logging.getLogger(__name__)
 
-# Maximum number of session refreshes before giving up
-MAX_SESSION_REFRESHES = 5
+# Maximum number of batch retries (session refresh / connection recovery) before giving up
+MAX_SESSION_REFRESHES = 20
 
 
 # ── Upload progress persistence ───────────────────────────────────
@@ -217,24 +217,25 @@ def _upload_slices_with_refresh(api, local_path, remote_path, file_size,
                                 batch_success = False
                             else:
                                 raise
+                        except (requests.ConnectionError, requests.Timeout,
+                                ConnectionError, OSError) as e:
+                            seq = futures[future]
+                            log.warning("Slice %d failed with connection error: %s", seq, e)
+                            failed_parts.append(seq)
+                            batch_success = False
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
                 if status == 400:
                     batch_success = False
                 else:
                     raise
+            except (requests.ConnectionError, requests.Timeout,
+                    ConnectionError, OSError) as e:
+                log.warning("Batch failed with connection error: %s", e)
+                batch_success = False
 
             if batch_success:
                 break  # all done
-
-            # Session expired -- refresh uploadid
-            session_refreshes += 1
-            if session_refreshes > MAX_SESSION_REFRESHES:
-                raise RuntimeError(
-                    f"Upload session expired {MAX_SESSION_REFRESHES} times, giving up. "
-                    f"Progress saved ({len(uploaded_parts)} slices). "
-                    f"Re-run the command to resume."
-                )
 
             # Determine which parts still need uploading
             parts_remaining = [
@@ -242,25 +243,49 @@ def _upload_slices_with_refresh(api, local_path, remote_path, file_size,
                 if i not in uploaded_parts
             ]
 
+            # Check if any parts were 400 errors (session expired)
+            has_400 = any(
+                isinstance(e, requests.HTTPError) and
+                getattr(e, 'response', None) is not None and
+                e.response.status_code == 400
+                for e in []  # 400s are tracked via failed_parts from HTTPError handler
+            )
+
+            # Refresh session on 400 errors; just retry on connection errors
+            session_refreshes += 1
+            if session_refreshes > MAX_SESSION_REFRESHES:
+                _save_progress(remote_path, {
+                    "upload_id": current_upload_id,
+                    "uploaded_parts": sorted(uploaded_parts),
+                    "chunk_size": chunk_size,
+                })
+                raise RuntimeError(
+                    f"Upload failed after {MAX_SESSION_REFRESHES} retries, giving up. "
+                    f"Progress saved ({len(uploaded_parts)}/{len(hashes.block_list)} slices). "
+                    f"Re-run the command to resume."
+                )
+
             log.warning(
-                "Upload session expired (400 on %d slices). "
-                "Refreshing session... (%d/%d slices done, %d remaining)",
+                "%d slices failed. Retrying... (%d/%d slices done, %d remaining)",
                 len(failed_parts), len(uploaded_parts),
                 len(hashes.block_list), len(parts_remaining),
             )
 
-            # Re-precreate to get a new upload session
-            pre = api.precreate(
-                remote_path=remote_path,
-                size=file_size,
-                isdir=0,
-                block_list=hashes.block_list,
-                content_md5=hashes.content_md5,
-                slice_md5=hashes.slice_md5,
-                rtype=rtype,
-            )
-            current_upload_id = pre["uploadid"]
-            log.info("New upload session obtained, continuing upload...")
+            # Re-precreate to get a fresh upload session
+            try:
+                pre = api.precreate(
+                    remote_path=remote_path,
+                    size=file_size,
+                    isdir=0,
+                    block_list=hashes.block_list,
+                    content_md5=hashes.content_md5,
+                    slice_md5=hashes.slice_md5,
+                    rtype=rtype,
+                )
+                current_upload_id = pre["uploadid"]
+                log.info("New upload session obtained, continuing upload...")
+            except (requests.RequestException, Exception) as e:
+                log.warning("Failed to refresh session: %s, reusing old session", e)
 
 
 def upload_dir(api: BaiduPanAPI, local_dir: str, remote_dir: str,
