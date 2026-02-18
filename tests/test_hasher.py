@@ -135,5 +135,5 @@ class TestComputeHashes:
         h = compute_hashes(str(p), use_cache=False)
         assert h.content_md5 == hashlib.md5(b"").hexdigest()
         assert h.slice_md5 == hashlib.md5(b"").hexdigest()
-        assert h.block_list == []  # no blocks for empty file
+        assert h.block_list == [hashlib.md5(b"").hexdigest()]  # one empty block for Baidu API compatibility
         assert h.file_size == 0

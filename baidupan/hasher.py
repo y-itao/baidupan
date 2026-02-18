@@ -123,8 +123,8 @@ def compute_hashes(filepath: str, use_cache: bool = True,
 
             bytes_read += len(data)
 
-    # flush last partial block
-    if block_bytes > 0:
+    # flush last partial block (or empty-file block)
+    if block_bytes > 0 or not block_list:
         block_list.append(block_hasher.hexdigest())
 
     result = FileHashes(
